@@ -14,6 +14,11 @@
 #include "thirdparty/uni_imgui/imgui_impl_win32.h"
 
 
+#include "thirdparty/instux/fakelag.h"
+#include "thirdparty/instux/SDK/fake_usercmd.h"
+#include "thirdparty/minhook-master/include/MinHook.h"
+
+
 #ifdef _WIN64
 #pragma comment(lib, "Bameware Base External_x64.lib")
 #pragma comment(lib, "Bameware Base Internal_x64.lib")
@@ -24,10 +29,140 @@
 #pragma comment(lib, "Bameware Base Shared_x86.lib")
 #endif
 
+template <typename T = void*>
+inline T GetVFunc(const void* thisptr, std::size_t nIndex)
+{
+	return (*static_cast<T* const*>(thisptr))[nIndex];
+}
+
+constexpr uintptr_t relative_to_absolute(uintptr_t address, int offset, int instruction_size = 7)
+{
+	auto instruction = address + offset;
+	int relative_address = *(int*)(instruction);
+	return address + instruction_size + relative_address;
+}
+
+template<typename T>
+T* get_vmt_from_instruction(uintptr_t address, size_t offset = 0)
+{
+	uintptr_t step = 3;
+	uintptr_t instruction = address + offset;
+
+	uintptr_t real_address = relative_to_absolute(instruction, step);
+	return *(T**)(real_address);
+}
+
+std::uintptr_t FindPattern(const char* szModuleName, const char* szPattern)
+{
+	static auto PatternByte = [](const char* szPattern) -> std::vector<int>
+		{
+			std::vector<int> vecBytes{ };
+			char* chStart = (char*)szPattern;
+			char* chEnd = (char*)szPattern + strlen(szPattern);
+
+			// convert pattern into bytes
+			for (char* chCurrent = chStart; chCurrent < chEnd; ++chCurrent)
+			{
+				// check is current byte a wildcard
+				if (*chCurrent == '?')
+				{
+					++chCurrent;
+
+					// check is next byte is also wildcard
+					if (*chCurrent == '?')
+						++chCurrent;
+
+					// ignore that
+					vecBytes.push_back(-1);
+				}
+				else
+					// convert byte to hex
+					vecBytes.push_back(strtoul(chCurrent, &chCurrent, 16));
+			}
+
+			return vecBytes;
+		};
+
+	const HMODULE hModule = GetModuleHandle(szModuleName);
+	if (hModule == nullptr)
+	{
+		return 0U;
+	}
+
+	auto pDosHeader = (PIMAGE_DOS_HEADER)hModule;
+	auto pNtHeaders = (PIMAGE_NT_HEADERS)((std::uint8_t*)hModule + pDosHeader->e_lfanew);
+
+	DWORD dwSizeOfImage = pNtHeaders->OptionalHeader.SizeOfImage;
+	std::vector<int> vecBytes = PatternByte(szPattern);
+	std::uint8_t* puBytes = (std::uint8_t*)(hModule);
+
+	std::size_t uSize = vecBytes.size();
+	int* pBytes = vecBytes.data();
+
+	// check for bytes sequence match
+	for (unsigned long i = 0UL; i < dwSizeOfImage - uSize; ++i)
+	{
+		bool bByteFound = true;
+
+		for (unsigned long j = 0UL; j < uSize; ++j)
+		{
+			// check if doenst match or byte isnt a wildcard
+			if (puBytes[i + j] != pBytes[j] && pBytes[j] != -1)
+			{
+				bByteFound = false;
+				break;
+			}
+		}
+
+		// return valid address
+		if (bByteFound)
+			return (std::uintptr_t)(&puBytes[i]);
+	}
+
+#if DEBUG_CONSOLE && _DEBUG
+	L::PushConsoleColor(FOREGROUND_RED);
+	L::Print(fmt::format(XorStr("[error] failed get pattern: [{}] [{}]"), szModuleName, szPattern));
+	L::PopConsoleColor();
+#endif
+
+	return 0U;
+}
+
+static bool   rebindOpen = false;
+static char   keyNameBuf[64] = "End";  // default name
+
+using tCreateMove = bool(__thiscall*)(void*, float, CUserCmd*);
+static tCreateMove oCreateMove = nullptr;
+
+bool __fastcall hkCreateMove(void* cl, float inputSampleTime, CUserCmd* cmd)
+{
+	return oCreateMove(cl, inputSampleTime, cmd);
+};
+
+using tCLMove = void(__cdecl*)(float, bool);
+static tCLMove oCLMove = nullptr;
+// speedhack
+int speedhak;
+void __cdecl hkCLMove(float inputSampleTime, bool pp)
+{
+
+	oCLMove(inputSampleTime, pp);
+	for (int i = 0; i <speedhak; i++)
+	 oCLMove(inputSampleTime, pp);
+};
+
 static WNDPROC originalWndProc = nullptr;
 
+LRESULT CALLBACK GameWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+		return TRUE;
+	return CallWindowProc(originalWndProc, hWnd, msg, wParam, lParam);
+}
+// asteya was here
 int Start()
 {
+	printf("Start() has begun!\n");
 	const auto GetGamePID = []() -> uint32_t
 	{
 		while (true)
@@ -112,7 +247,27 @@ int Start()
 	{
 		return *reinterpret_cast<uintptr_t*>(0x20 * (index - 0x2001i64) + uintptr_t(client_entity_list));
 	};
+	
+	uintptr_t clientBase = 0;
+	while (!(clientBase = memory_manager.GetModuleAddress("client.dll")))
+		Sleep(100);
 
+	// grab real CreateInterface
+	using CreateInterfaceFn = void* (*)(const char*, int*);
+	CreateInterfaceFn iface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(GetModuleHandleA("engine.dll"), "CreateInterface"));
+	if (!iface) { printf("No CreateInterface in engine.dll\n"); return 0; }
+
+	//void* client = CreateInterface("client.dll", "VClient");
+
+	//auto ass = relative_to_absolute((uintptr_t)FindPattern("client.dll", "48 8B 05 ? ? ? ? C3 CC CC CC CC CC CC CC CC 48 8D 05"), 3, 7);
+	//void* clientnode = *(void**)ass;
+
+
+	MH_Initialize();
+	MH_CreateHook((void*)FindPattern("client.dll", "40 53 48 83 EC ? 83 C9 ? 0F 29 74 24"), hkCreateMove, (void**)&oCreateMove);
+	MH_CreateHook((void*)FindPattern("engine.dll", "48 89 5C 24 ? 57 48 83 EC ? 0F 29 74 24 ? 0F B6 DA"), hkCLMove, (void**)&oCLMove);
+	MH_EnableHook(MH_ALL_HOOKS);
+	
 	// engine.dll + 0x61DD50
 
 	unsigned int frames = 0; float last_frame_update = 0.f;
@@ -121,7 +276,6 @@ int Start()
 		BAMEWARE::g_renderer.SetDimensions(game_window);
 		/// engine.dll+4FCF4C, engine.dll+7399D4
 		const auto view_matrix = memory_manager.ReadMemory<BAMEWARE::Matrix4x4>(engine_dll, 0x7399D4);
-
 		/// client.dll+90FBA0 | player dead or in spec turn off esp
 		const auto local_player = memory_manager.ReadMemory<uintptr_t>(client_dll, 0x90FBA0);
 		//memory_manager.ReadMemory<int>(local_player, 0x12C) <= 0 // local player health
@@ -140,17 +294,15 @@ int Start()
 			ImGui_ImplWin32_Init(BAMEWARE::g_renderer.GetWindowHandle());
 			ImGui_ImplDX11_Init(BAMEWARE::g_renderer.GetDevice(),
 			BAMEWARE::g_renderer.GetDeviceContext());
-			/*
+
+			//Chams::Initialize(BAMEWARE::g_renderer.GetDevice(), BAMEWARE::g_renderer.GetDeviceContext());
+			
 			originalWndProc = (WNDPROC)SetWindowLongPtr(
 				game_window,
 				GWLP_WNDPROC,
-				(LONG_PTR)+[](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
-					if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-						return true;
-					return CallWindowProc(originalWndProc, hWnd, msg, wParam, lParam);
-				}
+				(LONG_PTR)GameWindowProc
 			);
-			*/
+			
 			imguiInit = true;
 		}
 
@@ -169,7 +321,7 @@ int Start()
 
 			ImGui::Begin("Mango Menu");
 			ImGui::Checkbox("Enable ESP", &espEnabled);
-			// … add more ImGui widgets here …
+			ImGui::SliderInt("speedhak", &speedhak, 0, 10);
 			ImGui::End();
 		}
 
@@ -229,6 +381,9 @@ int Start()
 	ImGui_ImplWin32_Shutdown();
 	ImGui::DestroyContext(ImGui::GetCurrentContext());
 	*/
+	MH_RemoveHook(MH_ALL_HOOKS);
+	MH_Uninitialize();
+
 	return 0;
 }
 
@@ -247,6 +402,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 		SetConsoleTitle("Console:");
 		freopen("CONIN$", "r", stdin);
 		freopen("CONOUT$", "w", stdout);
+		setvbuf(stdout, nullptr, _IONBF, 0);
 
 		CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)Start, NULL, NULL, NULL);
 		break;
